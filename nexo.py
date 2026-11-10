@@ -424,13 +424,19 @@ def create_app():
             return fn(*a, **k)
         return wrapper
 
+    def login_page(err=""):
+        google = GOOGLE_BTN if (GOOGLE_ID and GOOGLE_SECRET) else ""
+        return LOGIN_HTML.replace("__ERR__", err).replace("__GOOGLE__", google)
+
     @app.route("/login", methods=["GET", "POST"])
     def login():
         err = ""
         if request.method == "POST":
+            e = request.form.get("email", "")
+            p = request.form.get("password", "")
             if time.time() < fails["until"]:
                 err = "Muitas tentativas. Aguarde alguns minutos."
-            elif check_login(request.form.get("email", ""), request.form.get("password", "")):
+            elif check_login(e, p):
                 fails["n"] = 0
                 session.permanent = True
                 session["ok"] = True
@@ -439,8 +445,47 @@ def create_app():
                 fails["n"] += 1
                 if fails["n"] >= 5:
                     fails.update(n=0, until=time.time() + 300)
-                err = "Email ou senha incorretos."
-        return LOGIN_HTML.replace("__ERR__", err)
+                # diagnostico temporario: so os tamanhos, nunca o conteudo
+                err = f"Email ou senha incorretos. (recebi email com {len(e.strip())} caracteres e senha com {len(p.strip())})"
+        return login_page(err)
+
+    @app.route("/auth/google")
+    def google_start():
+        if not (GOOGLE_ID and GOOGLE_SECRET):
+            return login_page("Login com Google nao configurado. Rode: python nexo.py google")
+        ru = urlparse(REDIRECT_URI)
+        if request.host != ru.netloc:  # o cookie precisa nascer no mesmo endereco do retorno
+            return redirect(f"{ru.scheme}://{ru.netloc}/auth/google")
+        state = secrets.token_urlsafe(24)
+        session["oauth_state"] = state
+        params = {"client_id": GOOGLE_ID, "redirect_uri": REDIRECT_URI, "response_type": "code",
+                  "scope": "openid email", "state": state, "login_hint": ALLOWED_EMAIL,
+                  "prompt": "select_account"}
+        return redirect("https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params))
+
+    @app.route("/auth/google/callback")
+    def google_callback():
+        import requests
+        expected = session.pop("oauth_state", "")
+        got = request.args.get("state", "")
+        if request.args.get("error") or not expected or not hmac.compare_digest(expected, got):
+            return login_page("Login com Google cancelado ou invalido. Tente de novo.")
+        try:
+            tok = requests.post("https://oauth2.googleapis.com/token", timeout=20, data={
+                "code": request.args.get("code", ""), "client_id": GOOGLE_ID,
+                "client_secret": GOOGLE_SECRET, "redirect_uri": REDIRECT_URI,
+                "grant_type": "authorization_code"})
+            tok.raise_for_status()
+            info = requests.get("https://openidconnect.googleapis.com/v1/userinfo", timeout=20,
+                                headers={"Authorization": "Bearer " + tok.json()["access_token"]}).json()
+        except Exception as ex:
+            return login_page(f"Falha ao falar com o Google: {ex}")
+        mail = str(info.get("email", "")).strip().lower()
+        if info.get("email_verified") is True and mail and hmac.compare_digest(mail, ALLOWED_EMAIL):
+            session.permanent = True
+            session["ok"] = True
+            return redirect("/")
+        return login_page("Essa conta Google nao tem acesso ao Nexo.")
 
     @app.route("/logout")
     def logout():
@@ -494,12 +539,14 @@ def run():
         sys.exit(1)
     sync_pull()
     app = create_app()
-    print(f"Nexo rodando em http://127.0.0.1:{PORT}  (modelo: {MODEL})")
+    print(f"Nexo rodando. Abra no navegador: http://localhost:{PORT}  (modelo: {MODEL})")
     app.run(host="127.0.0.1", port=PORT, threaded=True)
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "setup":
         setup()
+    elif len(sys.argv) > 1 and sys.argv[1] == "google":
+        google_setup()
     else:
         run()
