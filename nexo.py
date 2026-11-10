@@ -224,10 +224,10 @@ def remove(item_id, who=None):
     return False
 
 
-def search(kind, query, k=5, who=None):
+def search(kind, query, k=5, who=None, min_score=1):
     q = words(query)
     scored = [(len(q & words(i["texto"])), i["data"], i) for i in load(kind, who)]
-    scored = [s for s in scored if s[0] > 0]
+    scored = [s for s in scored if s[0] >= min_score]
     scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
     return [s[2] for s in scored[:k]]
 
@@ -239,13 +239,15 @@ def build_system(query, who=None):
         fatos = search("fato", query, 15, who)
     if fatos:
         parts.append("## Fatos sobre o usuario\n" + "\n".join(f"- {f['texto']}" for f in fatos))
-    licoes = search("licao", query, 6, who)
+    licoes = load("licao", who)
+    if len(licoes) > 8:
+        licoes = search("licao", query, 6, who)
     if licoes:
         parts.append("## Licoes (regras aprendidas, siga-as)\n" + "\n".join(f"- {l['texto']}" for l in licoes))
-    exemplos = search("exemplo", query, 2, who)
+    exemplos = search("exemplo", query, 1, who, min_score=3)
     if exemplos:
-        ex = "\n\n".join(f"Pergunta: {e['texto']}\nResposta aprovada:\n{e['resposta']}" for e in exemplos)
-        parts.append("## Exemplos de respostas que o usuario aprovou\n" + ex)
+        ex = "\n\n".join(f"Pergunta: {e['texto']}\nResposta aprovada:\n{e['resposta'][:600]}" for e in exemplos)
+        parts.append("## Exemplo de resposta que o usuario aprovou\n" + ex)
     return "\n\n".join(parts)
 
 
@@ -317,6 +319,7 @@ def llm_stream(messages, temperature=0.4):
     with requests.post(f"{BASE_URL}/chat/completions", headers=_headers(), timeout=900,
                        json=body, stream=True) as r:
         r.raise_for_status()
+        r.encoding = "utf-8"
         for line in r.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data:"):
                 continue
@@ -367,7 +370,7 @@ def ensure_ollama():
 
 
 EXTRACT = (
-    "Voce extrai memorias de uma mensagem do USUARIO. Responda SOMENTE com um objeto JSON "
+    "Voce extrai memorias de mensagens do USUARIO. Responda SOMENTE com um objeto JSON "
     '{"fatos": [...], "licoes": [...]}. '
     "fatos: ate 3 fatos duraveis que o usuario disse sobre si (nome, projetos, preferencias, "
     "tecnologias, objetivos), em frases curtas na terceira pessoa. "
@@ -376,34 +379,110 @@ EXTRACT = (
     "Ignore saudacoes, perguntas soltas e trivialidades. Se nao houver nada, use listas vazias."
 )
 
-# So gasta o modelo para aprender quando a mensagem parece conter algo sobre o usuario.
+# Mensagens que parecem conter algo sobre o usuario (so essas vao para a extracao com o modelo).
 FIRST_PERSON = re.compile(
     r"\b(eu|meu|minha|meus|minhas|me chamo|estou|uso|gosto|prefiro|quero|trabalho|moro|"
     r"crio|criando|fazendo|sempre|nunca|errado|na verdade|lembre|aprenda)\b")
 PRAISE = re.compile(r"^(valeu|perfeito|funcionou|obrigad[oa]|isso mesmo|ficou (bom|otimo)|"
                     r"top|show|deu certo|boa)\b")
 
+# Nunca aprende sozinho coisas que parecem segredo (a memoria vai para o GitHub).
+SENSITIVE = re.compile(r"senha|password|passwd|token|ghp_|api.?key|secret|cpf|cart[aã]o|\b\d{9,}\b", re.I)
+
+LLM_LEARN = os.getenv("NEXO_LLM_LEARN", "1") == "1"
+IDLE_SECS = int(os.getenv("NEXO_IDLE_SECS", "25"))  # espera ficar parado antes de gastar o modelo
+
+# Aprendizado instantaneo (sem modelo): frases comuns viram fatos.
+FACT_PATTERNS = [
+    (r"\b(?:meu nome (?:é|e)|me chamo|pode me chamar de)\s+"
+     r"([A-Za-zÀ-ÿ'-]+(?:\s+(?!e\b|mas\b|que\b)[A-Za-zÀ-ÿ'-]+){0,2})", "O nome do usuário é {0}"),
+    (r"\bmeu projeto (?:é|e|se chama|chama)\s+([^.!?\n]{3,80})", "O projeto do usuário é {0}"),
+    (r"\b(?:estou|tô|to) (?:criando|fazendo|desenvolvendo|construindo)\s+([^.!?\n]{3,80})",
+     "O usuário está desenvolvendo {0}"),
+    (r"\beu trabalho (?:com|como|na|no)\s+([^.!?\n]{3,60})", "O usuário trabalha com {0}"),
+    (r"\beu prefiro\s+([^.!?\n]{2,60})", "O usuário prefere {0}"),
+    (r"\beu gosto de\s+([^.!?\n]{2,60})", "O usuário gosta de {0}"),
+    (r"\beu uso\s+([^.!?\n]{2,60})", "O usuário usa {0}"),
+    (r"\beu estudo\s+([^.!?\n]{2,60})", "O usuário estuda {0}"),
+    (r"\beu programo em\s+([^.!?\n]{2,60})", "O usuário programa em {0}"),
+    (r"\b(?:lembre(?:-se)? que|anota que|aprenda que|guarde que|saiba que)\s+([^\n]{4,150})", "{0}"),
+]
+LESSON_RE = re.compile(
+    r"\b(?:da pr[oó]xima vez|daqui pra frente|daqui em diante|a partir de agora|nunca mais|"
+    r"sempre (?:me )?(?:responda|use|escreva|fa[cç]a|mostre|explique)|n[aã]o (?:me )?(?:responda|use|escreva))\b",
+    re.I)
+
+_learn = {"t": time.time(), "busy": 0, "pending": []}
+_learn_lock = threading.Lock()
+
 
 def should_learn(user):
     return len(user) >= 20 and bool(FIRST_PERSON.search(norm(user)))
 
 
-def autolearn(user, reply, who=None):
-    """Aprende sozinho fatos e licoes a partir do que o USUARIO disse (nao da resposta)."""
-    if not should_learn(user):
+def _keep(kind, text, who=None):
+    text = text.strip()
+    if not text or SENSITIVE.search(text):
         return
+    if add(kind, text, who):
+        print(f"[aprendi] {kind}: {text}")
+
+
+def learn_fast(user, who=None):
+    """Aprende na hora, sem gastar o modelo: fatos e regras ditos de forma direta."""
+    try:
+        for sent in re.split(r"(?<=[.!?])\s+|\n+", user[:2000]):
+            sent = sent.strip()
+            if len(sent) < 8:
+                continue
+            if LESSON_RE.search(sent):
+                _keep("licao", sent[:200], who)
+            for pat, tpl in FACT_PATTERNS:
+                m = re.search(pat, sent, re.I)
+                if m:
+                    _keep("fato", tpl.format(*[g.strip(" \"'") for g in m.groups()]), who)
+    except Exception as e:
+        print("Aviso: aprendizado rapido falhou:", e)
+
+
+def learn_llm(text, who=None):
+    """Extracao mais profunda com o modelo (roda so quando o Nexo esta parado)."""
     try:
         out = llm([{"role": "system", "content": EXTRACT},
-                   {"role": "user", "content": user[:1500]}], 0, 200)
+                   {"role": "user", "content": text[:2000]}], 0, 250)
         m = re.search(r"\{.*\}", out, re.S)
         data = json.loads(m.group(0)) if m else {}
         for key, kind in (("fatos", "fato"), ("licoes", "licao")):
             lst = data.get(key) if isinstance(data, dict) else None
             for t in (lst if isinstance(lst, list) else [])[:3]:
-                if isinstance(t, str) and 3 < len(t) < 200 and add(kind, t, who):
-                    print(f"[aprendi] {kind}: {t}")
+                if isinstance(t, str) and 3 < len(t) < 200:
+                    _keep(kind, t, who)
     except Exception as e:
-        print("Aviso: aprendizado automatico falhou:", e)
+        print("Aviso: aprendizado com o modelo falhou:", e)
+
+
+def queue_learning(who, msg):
+    if LLM_LEARN and should_learn(msg):
+        with _learn_lock:
+            _learn["pending"].append((who, msg[:1000]))
+
+
+def idle_worker():
+    """Quando ninguem esta conversando, o Nexo revisa as ultimas mensagens e aprende mais."""
+    while True:
+        time.sleep(5)
+        try:
+            if _learn["busy"] or time.time() - _learn["t"] < IDLE_SECS:
+                continue
+            with _learn_lock:
+                batch, _learn["pending"] = _learn["pending"], []
+            by = {}
+            for who, m in batch:
+                by.setdefault(who, []).append(m)
+            for who, msgs in by.items():
+                learn_llm("\n".join(msgs[-5:]), who)
+        except Exception as e:
+            print("Aviso: revisao em segundo plano falhou:", e)
 
 
 AJUDA = (
@@ -469,8 +548,9 @@ CHAT_HTML = r'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <style>
 *{box-sizing:border-box}
 body{margin:0;height:100dvh;display:flex;flex-direction:column;background:#0f1115;color:#e8e8ea;font-family:system-ui,sans-serif}
-header{padding:12px 16px;border-bottom:1px solid #22252d;display:flex;justify-content:space-between;align-items:center}
+header{padding:10px 16px;border-bottom:1px solid #22252d;display:flex;justify-content:space-between;align-items:center}
 header b{font-size:18px}header a{color:#8a8fa0;font-size:13px;text-decoration:none}
+#menu{background:none;border:0;color:#e8e8ea;font-size:24px;padding:2px 12px 2px 0;line-height:1}
 #log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
 .m{max-width:88%;padding:10px 13px;border-radius:14px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word}
 .u{align-self:flex-end;background:#6d5efc}
@@ -480,12 +560,26 @@ header b{font-size:18px}header a{color:#8a8fa0;font-size:13px;text-decoration:no
 form{display:flex;gap:8px;padding:10px;border-top:1px solid #22252d}
 textarea{flex:1;resize:none;max-height:140px;padding:11px;border-radius:12px;border:1px solid #2a2e37;background:#181b22;color:inherit;font-size:16px;font-family:inherit}
 button.send{padding:0 18px;border:0;border-radius:12px;background:#6d5efc;color:#fff;font-weight:600;font-size:16px}
+#ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:5}
+#side{position:fixed;top:0;left:0;bottom:0;width:min(310px,84vw);background:#14171d;border-right:1px solid #22252d;transform:translateX(-100%);transition:transform .2s;z-index:6;display:flex;flex-direction:column}
+body.open #side{transform:none}body.open #ov{display:block}
+#side h2{margin:0;padding:16px 16px 4px;font-size:18px}
+#new{margin:12px;padding:12px;border-radius:10px;border:0;background:#6d5efc;color:#fff;font-weight:600;font-size:15px}
+#list{flex:1;overflow-y:auto;padding:0 8px 12px}
+.ci{display:flex;align-items:center;gap:6px;padding:11px 10px;border-radius:10px;font-size:15px}
+.ci.on{background:#1f2330}
+.ci span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ci button{background:none;border:0;color:#8a8fa0;font-size:15px;padding:2px 6px}
+.vazio{color:#8a8fa0;padding:12px;font-size:14px}
 </style></head><body>
-<header><b>Nexo</b><span id="left" style="font-size:13px;color:#8a8fa0"></span><a href="/logout">sair</a></header>
+<div id="ov"></div>
+<aside id="side"><h2>Conversas</h2><button id="new">＋ Novo chat</button><div id="list"></div></aside>
+<header><div style="display:flex;align-items:center"><button id="menu" aria-label="Menu">☰</button><b>Nexo</b></div><span id="left" style="font-size:13px;color:#8a8fa0"></span><a href="/logout">sair</a></header>
 <div id="log"></div>
 <form id="f"><textarea id="t" rows="1" placeholder="Fale com o Nexo... (/ajuda)"></textarea><button class="send">Enviar</button></form>
 <script>
 const log=document.getElementById('log'),t=document.getElementById('t'),f=document.getElementById('f');
+let cur=null,busy=false;
 const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
 function render(x){return x.split('```').map((p,i)=>i%2?'<pre><code>'+esc(p.replace(/^\w*\n/,''))+'</code></pre>':esc(p)).join('');}
 function likeBtn(d,id){const b=document.createElement('button');b.className='like';b.textContent='👍';
@@ -497,14 +591,40 @@ function add(cls,text,id){
   log.appendChild(d);log.scrollTop=log.scrollHeight;return d;
 }
 const setLeft=n=>{if(n!=null)document.getElementById('left').textContent='restam '+n+' hoje';};
+const openMenu=o=>document.body.classList.toggle('open',o);
+async function api(url,opt){const r=await fetch(url,opt);if(r.status===401){location='/login';throw new Error('login');}return r.json();}
+async function loadList(){
+  const j=await api('/api/chats'),el=document.getElementById('list');el.innerHTML='';
+  j.chats.forEach(c=>{
+    const d=document.createElement('div');d.className='ci'+(c.id===cur?' on':'');
+    const s=document.createElement('span');s.textContent=c.titulo;
+    const b=document.createElement('button');b.textContent='🗑';
+    b.onclick=async ev=>{ev.stopPropagation();if(!confirm('Apagar esta conversa?'))return;
+      await api('/api/chats/'+c.id,{method:'DELETE'});if(c.id===cur)newChat(false);loadList();};
+    d.onclick=()=>{openChat(c.id);openMenu(false);};
+    d.append(s,b);el.appendChild(d);
+  });
+  if(!j.chats.length)el.innerHTML='<div class="vazio">Nenhuma conversa ainda.</div>';
+  return j.chats;
+}
+function newChat(close=true){cur=null;log.innerHTML='';if(close)openMenu(false);t.focus();}
+async function openChat(id){
+  const j=await api('/api/chats/'+id);
+  if(j.error){newChat(false);return;}
+  cur=id;log.innerHTML='';j.msgs.forEach(m=>add(m.role==='user'?'u':'a',m.content));
+}
+document.getElementById('menu').onclick=()=>{openMenu(true);loadList();};
+document.getElementById('ov').onclick=()=>openMenu(false);
+document.getElementById('new').onclick=()=>newChat(true);
 f.onsubmit=async e=>{
-  e.preventDefault();const msg=t.value.trim();if(!msg)return;
-  t.value='';add('u',msg);const w=add('a','...');
+  e.preventDefault();const msg=t.value.trim();if(!msg||busy)return;
+  if(msg.toLowerCase()==='/novo'){t.value='';newChat(false);return;}
+  busy=true;t.value='';add('u',msg);const w=add('a','...');
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,chat_id:cur})});
     if(r.status===401){location='/login';return;}
     if(!(r.headers.get('content-type')||'').includes('ndjson')){
-      const j=await r.json();w.remove();add('a',j.reply||('Erro: '+j.error),j.id);setLeft(j.left);return;}
+      const j=await r.json();w.remove();add('a',j.reply||('Erro: '+j.error),j.id);setLeft(j.left);if(j.chat)cur=j.chat;return;}
     const rd=r.body.getReader(),dec=new TextDecoder();let buf='',txt='';
     for(;;){
       const {value,done}=await rd.read();if(done)break;
@@ -515,11 +635,13 @@ f.onsubmit=async e=>{
         const j=JSON.parse(line);
         if(j.t){txt+=j.t;w.innerHTML=render(txt);log.scrollTop=log.scrollHeight;}
         else if(j.error){txt+=(txt?'\n\n':'')+'Erro: '+j.error;w.innerHTML=render(txt);}
-        else if(j.done){if(j.id)likeBtn(w,j.id);setLeft(j.left);}
+        else if(j.done){if(j.chat)cur=j.chat;if(j.id)likeBtn(w,j.id);setLeft(j.left);}
       }
     }
   }catch(err){w.remove();add('a','Erro de conexao: '+err);}
+  finally{busy=false;}
 };
+(async()=>{try{const l=await loadList();if(l.length)openChat(l[0].id);}catch(e){}})();
 </script></body></html>'''
 
 
@@ -569,6 +691,59 @@ def guest_allowed(mail):
     return "*" in GUESTS or mail in GUESTS
 
 
+# ------------------------------------------------------------ historico de conversas
+# As conversas ficam so no celular (pasta data/chats, fora do GitHub).
+CHATS = DATA / "chats"
+_chat_lock = threading.RLock()
+
+
+def _cdir(who):
+    d = CHATS / hashlib.sha256(who.encode()).hexdigest()[:12]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _cpath(who, cid):
+    if not re.fullmatch(r"[0-9a-f]{12}", cid or ""):
+        return None
+    return _cdir(who) / f"{cid}.json"
+
+
+def chat_load(who, cid):
+    p = _cpath(who, cid)
+    if not p:
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def chat_save(who, c):
+    c["atualizado"] = datetime.now().isoformat(timespec="seconds")
+    with _chat_lock:
+        _cpath(who, c["id"]).write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+
+
+def chat_new(first=""):
+    now = datetime.now().isoformat(timespec="seconds")
+    title = " ".join(first.split())[:40] or "Nova conversa"
+    return {"id": uuid.uuid4().hex[:12], "titulo": title, "criado": now, "atualizado": now, "msgs": []}
+
+
+def chat_list(who):
+    out = []
+    for p in _cdir(who).glob("*.json"):
+        try:
+            c = json.loads(p.read_text(encoding="utf-8"))
+            out.append({"id": c["id"], "titulo": c.get("titulo", "Conversa"),
+                        "atualizado": c.get("atualizado", "")})
+        except (OSError, ValueError, KeyError):
+            continue
+    out.sort(key=lambda x: x["atualizado"], reverse=True)
+    return out
+
+
 def create_app():
     from flask import Flask, Response, jsonify, redirect, request, session, stream_with_context
 
@@ -583,7 +758,7 @@ def create_app():
     app.permanent_session_lifetime = timedelta(days=30)
     app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
-    histories, recent, last = {}, {}, {}
+    recent, last = {}, {}
     fails = {"n": 0, "until": 0.0}
 
     def login_required(fn):
@@ -675,14 +850,21 @@ def create_app():
     @app.post("/api/chat")
     @login_required
     def chat():
-        msg = ((request.get_json(silent=True) or {}).get("message") or "").strip()
+        body = request.get_json(silent=True) or {}
+        msg = (body.get("message") or "").strip()
         if not msg:
             return jsonify(error="mensagem vazia"), 400
         who = session["user"]
-        history = histories.setdefault(who, [])
         msg = msg[:8000]
+        c = chat_load(who, body.get("chat_id")) or chat_new(msg)
         if msg.startswith("/"):
-            return jsonify(reply=command(msg, history, who))
+            if msg.split()[0].lower() == "/novo":
+                return jsonify(reply="Para começar outra conversa, toque em ＋ Novo chat no menu (☰).")
+            reply = command(msg, [], who)
+            c["msgs"] += [{"role": "user", "content": msg, "cmd": True},
+                          {"role": "assistant", "content": reply, "cmd": True}]
+            chat_save(who, c)
+            return jsonify(reply=reply, chat=c["id"])
         if len(msg) <= 60 and PRAISE.search(norm(msg).strip()) and who in last:
             q, a = last[who]  # o usuario aprovou a resposta anterior: aprende sozinho
             if add("exemplo", q, who, resposta=a):
@@ -690,33 +872,66 @@ def create_app():
         left = usage_take(who)
         if left == -1:
             return jsonify(reply=f"Você atingiu o limite de {GUEST_LIMIT} mensagens de hoje. Volte amanhã!", left=0)
+        history = [{"role": m["role"], "content": m["content"][:1500]} for m in c["msgs"] if not m.get("cmd")]
         history.append({"role": "user", "content": msg})
         messages = [{"role": "system", "content": build_system(msg, who)}] + history[-HIST:]
+
         def gen():
             parts = []
+            _learn["busy"] += 1
+            t0, first = time.time(), None
             try:
-                for tok in llm_stream(messages):
-                    parts.append(tok)
-                    yield json.dumps({"t": tok}) + "\n"
-            except Exception as e:
-                if history and history[-1]["role"] == "user":
-                    history.pop()
-                usage_refund(who)
-                yield json.dumps({"error": f"falha ao falar com o modelo: {friendly_error(e)}"}) + "\n"
-                return
-            reply = "".join(parts).strip() or "(sem resposta)"
-            history.append({"role": "assistant", "content": reply})
-            last[who] = (msg, reply)
-            mid = uuid.uuid4().hex[:8]
-            recent[mid] = (who, msg, reply)
-            while len(recent) > 50:
-                recent.pop(next(iter(recent)))
-            if AUTOLEARN:
-                threading.Thread(target=autolearn, args=(msg, reply, who), daemon=True).start()
-            yield json.dumps({"done": True, "id": mid, "left": left}) + "\n"
+                try:
+                    for tok in llm_stream(messages):
+                        if first is None:
+                            first = time.time() - t0
+                        parts.append(tok)
+                        yield json.dumps({"t": tok}) + "\n"
+                except Exception as e:
+                    usage_refund(who)
+                    yield json.dumps({"error": f"falha ao falar com o modelo: {friendly_error(e)}"}) + "\n"
+                    return
+                reply = "".join(parts).strip() or "(sem resposta)"
+                print(f"[tempo] 1a palavra {first or 0:.1f}s | total {time.time() - t0:.1f}s | {len(parts)} trechos")
+                c["msgs"] += [{"role": "user", "content": msg}, {"role": "assistant", "content": reply}]
+                chat_save(who, c)
+                last[who] = (msg, reply)
+                mid = uuid.uuid4().hex[:8]
+                recent[mid] = (who, msg, reply)
+                while len(recent) > 50:
+                    recent.pop(next(iter(recent)))
+                if AUTOLEARN:
+                    learn_fast(msg, who)
+                    queue_learning(who, msg)
+                yield json.dumps({"done": True, "id": mid, "left": left, "chat": c["id"]}) + "\n"
+            finally:
+                _learn["busy"] -= 1
+                _learn["t"] = time.time()
 
         return Response(stream_with_context(gen()), mimetype="application/x-ndjson",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.get("/api/chats")
+    @login_required
+    def chats_list():
+        return jsonify(chats=chat_list(session["user"]))
+
+    @app.get("/api/chats/<cid>")
+    @login_required
+    def chats_get(cid):
+        c = chat_load(session["user"], cid)
+        if not c:
+            return jsonify(error="conversa nao encontrada"), 404
+        return jsonify(id=c["id"], titulo=c["titulo"],
+                       msgs=[{"role": m["role"], "content": m["content"]} for m in c["msgs"]])
+
+    @app.delete("/api/chats/<cid>")
+    @login_required
+    def chats_del(cid):
+        p = _cpath(session["user"], cid)
+        if p and p.exists():
+            p.unlink()
+        return jsonify(ok=True)
 
     @app.post("/api/like")
     @login_required
@@ -737,6 +952,8 @@ def run():
     sync_pull()
     ensure_ollama()
     app = create_app()
+    if AUTOLEARN and LLM_LEARN:
+        threading.Thread(target=idle_worker, daemon=True).start()
     print(f"Nexo rodando. Abra no navegador: http://localhost:{PORT}  (modelo: {MODEL})")
     app.run(host="127.0.0.1", port=PORT, threaded=True)
 
