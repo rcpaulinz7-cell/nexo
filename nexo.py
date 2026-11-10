@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -44,6 +45,10 @@ NEXO_API_KEY=
 NEXO_PORT=5000
 NEXO_AUTOLEARN=1
 
+# Outras contas Google: * = qualquer uma, ou emails separados por virgula, ou vazio = ninguem
+NEXO_GUESTS=*
+NEXO_GUEST_LIMIT=100
+
 # Login com Google (preencha com: python nexo.py google)
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
@@ -72,6 +77,10 @@ GOOGLE_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 # Abra o Nexo por http://localhost:PORT (e nao 127.0.0.1) para o login Google funcionar.
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", f"http://localhost:{PORT}/auth/google/callback")
+# Contas convidadas: "*" = qualquer conta Google que passe pelo login; ou uma lista de emails
+# separados por virgula; deixe vazio para desligar. O dono (NEXO_EMAIL) nunca tem limite.
+GUESTS = [g.strip().lower() for g in os.getenv("NEXO_GUESTS", "*").split(",") if g.strip()]
+GUEST_LIMIT = int(os.getenv("NEXO_GUEST_LIMIT", "100"))  # mensagens por dia
 HIST = 12  # mensagens recentes enviadas ao modelo
 
 SYSTEM = (
@@ -145,20 +154,32 @@ KINDS = {"fato": "fatos.json", "licao": "licoes.json", "exemplo": "exemplos.json
 _lock = threading.RLock()
 
 
-def _path(kind):
-    return MEM / KINDS[kind]
+def is_owner(who):
+    return not who or who == ALLOWED_EMAIL
 
 
-def load(kind):
+def _dir(who=None):
+    """Pasta de memoria: o dono usa memoria/; cada convidado tem a sua propria."""
+    if is_owner(who):
+        return MEM
+    return MEM / "usuarios" / hashlib.sha256(who.encode()).hexdigest()[:12]
+
+
+def _path(kind, who=None):
+    return _dir(who) / KINDS[kind]
+
+
+def load(kind, who=None):
     try:
-        return json.loads(_path(kind).read_text(encoding="utf-8"))
+        return json.loads(_path(kind, who).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
 
-def save(kind, items):
-    MEM.mkdir(exist_ok=True)
-    _path(kind).write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+def save(kind, items, who=None):
+    p = _path(kind, who)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def norm(t):
@@ -169,53 +190,58 @@ def words(t):
     return set(re.findall(r"[a-z0-9_]{3,}", norm(t)))
 
 
-def add(kind, texto, **extra):
-    texto = texto.strip()
+GUEST_MAX_ITEMS = 500  # limite de memorias por convidado em cada tipo
+
+
+def add(kind, texto, who=None, **extra):
+    texto = texto.strip()[:1000]
     if not texto:
         return None
     with _lock:
-        items = load(kind)
+        items = load(kind, who)
         if any(norm(i["texto"]) == norm(texto) for i in items):
+            return None
+        if not is_owner(who) and len(items) >= GUEST_MAX_ITEMS:
             return None
         item = {"id": uuid.uuid4().hex[:6], "texto": texto,
                 "data": datetime.now().isoformat(timespec="seconds"), **extra}
         items.append(item)
-        save(kind, items)
+        save(kind, items, who)
     sync_push(f"nexo: novo {kind}")
     return item
 
 
-def remove(item_id):
+def remove(item_id, who=None):
     with _lock:
         for kind in KINDS:
-            items = load(kind)
+            items = load(kind, who)
             kept = [i for i in items if i["id"] != item_id]
             if len(kept) != len(items):
-                save(kind, kept)
+                save(kind, kept, who)
                 sync_push(f"nexo: removeu {kind}")
                 return True
     return False
 
 
-def search(kind, query, k=5):
+def search(kind, query, k=5, who=None):
     q = words(query)
-    scored = [(len(q & words(i["texto"])), i["data"], i) for i in load(kind)]
+    scored = [(len(q & words(i["texto"])), i["data"], i) for i in load(kind, who)]
     scored = [s for s in scored if s[0] > 0]
     scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
     return [s[2] for s in scored[:k]]
 
 
-def build_system(query):
+def build_system(query, who=None):
     parts = [SYSTEM]
-    fatos = load("fato")
+    fatos = load("fato", who)
     if len(fatos) > 40:
-        fatos = search("fato", query, 15)
+        fatos = search("fato", query, 15, who)
     if fatos:
         parts.append("## Fatos sobre o usuario\n" + "\n".join(f"- {f['texto']}" for f in fatos))
-    licoes = search("licao", query, 6)
+    licoes = search("licao", query, 6, who)
     if licoes:
         parts.append("## Licoes (regras aprendidas, siga-as)\n" + "\n".join(f"- {l['texto']}" for l in licoes))
-    exemplos = search("exemplo", query, 2)
+    exemplos = search("exemplo", query, 2, who)
     if exemplos:
         ex = "\n\n".join(f"Pergunta: {e['texto']}\nResposta aprovada:\n{e['resposta']}" for e in exemplos)
         parts.append("## Exemplos de respostas que o usuario aprovou\n" + ex)
@@ -276,24 +302,78 @@ def llm(messages, temperature=0.4):
     return r.json()["choices"][0]["message"]["content"]
 
 
-EXTRACT = (
-    "Extraia no maximo 3 fatos duraveis e uteis que o USUARIO disse sobre si "
-    "(nome, projetos, preferencias, tecnologias, objetivos). Ignore trivialidades e nada "
-    "que o assistente tenha inventado. Responda SOMENTE com uma lista JSON de strings curtas, "
-    "ou [] se nao houver nada."
-)
+def friendly_error(e):
+    s = str(e)
+    if type(e).__name__ == "ConnectionError" or "Connection refused" in s:
+        return (f"o modelo não está respondendo em {BASE_URL}. Se você usa o Ollama, "
+                "ele precisa estar rodando (comando: ollama serve).")
+    if "404" in s:
+        return f"modelo '{MODEL}' não encontrado. Se você usa o Ollama, rode: ollama pull {MODEL}"
+    return s
 
 
-def autolearn(user, reply):
+def ensure_ollama():
+    """Se o modelo for um Ollama local que esta desligado, tenta ligar sozinho."""
+    if "11434" not in BASE_URL or not shutil.which("ollama"):
+        return
+    import requests
+    root = BASE_URL[:-3] if BASE_URL.endswith("/v1") else BASE_URL
     try:
-        out = llm([{"role": "system", "content": EXTRACT},
-                   {"role": "user", "content": f"Usuario: {user}\nNexo: {reply}"}], 0)
-        m = re.search(r"\[.*\]", out, re.S)
-        for f in (json.loads(m.group(0)) if m else [])[:3]:
-            if isinstance(f, str) and 3 < len(f) < 200:
-                add("fato", f)
+        requests.get(root, timeout=2)
+        return
     except Exception:
         pass
+    print("Ligando o Ollama...")
+    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(20):
+        time.sleep(1)
+        try:
+            requests.get(root, timeout=2)
+            print("Ollama ligado.")
+            return
+        except Exception:
+            pass
+    print("Aviso: o Ollama nao respondeu. Rode 'ollama serve' em outra sessao do Termux.")
+
+
+EXTRACT = (
+    "Voce extrai memorias de uma mensagem do USUARIO. Responda SOMENTE com um objeto JSON "
+    '{"fatos": [...], "licoes": [...]}. '
+    "fatos: ate 3 fatos duraveis que o usuario disse sobre si (nome, projetos, preferencias, "
+    "tecnologias, objetivos), em frases curtas na terceira pessoa. "
+    "licoes: ate 2 regras sobre como o usuario quer que o assistente se comporte, ou "
+    "correcoes que ele fez (ex.: 'Responder sempre com codigo completo'). "
+    "Ignore saudacoes, perguntas soltas e trivialidades. Se nao houver nada, use listas vazias."
+)
+
+# So gasta o modelo para aprender quando a mensagem parece conter algo sobre o usuario.
+FIRST_PERSON = re.compile(
+    r"\b(eu|meu|minha|meus|minhas|me chamo|estou|uso|gosto|prefiro|quero|trabalho|moro|"
+    r"crio|criando|fazendo|sempre|nunca|errado|na verdade|lembre|aprenda)\b")
+PRAISE = re.compile(r"^(valeu|perfeito|funcionou|obrigad[oa]|isso mesmo|ficou (bom|otimo)|"
+                    r"top|show|deu certo|boa)\b")
+
+
+def should_learn(user):
+    return len(user) >= 20 and bool(FIRST_PERSON.search(norm(user)))
+
+
+def autolearn(user, reply, who=None):
+    """Aprende sozinho fatos e licoes a partir do que o USUARIO disse (nao da resposta)."""
+    if not should_learn(user):
+        return
+    try:
+        out = llm([{"role": "system", "content": EXTRACT},
+                   {"role": "user", "content": user[:1500]}], 0)
+        m = re.search(r"\{.*\}", out, re.S)
+        data = json.loads(m.group(0)) if m else {}
+        for key, kind in (("fatos", "fato"), ("licoes", "licao")):
+            lst = data.get(key) if isinstance(data, dict) else None
+            for t in (lst if isinstance(lst, list) else [])[:3]:
+                if isinstance(t, str) and 3 < len(t) < 200 and add(kind, t, who):
+                    print(f"[aprendi] {kind}: {t}")
+    except Exception as e:
+        print("Aviso: aprendizado automatico falhou:", e)
 
 
 AJUDA = (
@@ -307,24 +387,24 @@ AJUDA = (
 )
 
 
-def command(msg, history):
+def command(msg, history, who=None):
     cmd, _, arg = msg.partition(" ")
     cmd, arg = cmd.lower(), arg.strip()
     if cmd == "/lembrar":
-        it = add("fato", arg)
+        it = add("fato", arg, who)
         return f"Guardado ({it['id']})." if it else "Nada novo para guardar."
     if cmd == "/licao":
-        it = add("licao", arg)
+        it = add("licao", arg, who)
         return f"Licao guardada ({it['id']})." if it else "Nada novo para guardar."
     if cmd == "/esquecer":
-        return "Apagado." if remove(arg) else "Nao achei esse id."
+        return "Apagado." if remove(arg, who) else "Nao achei esse id."
     if cmd == "/novo":
         history.clear()
         return "Conversa limpa. A memoria continua."
     if cmd == "/memoria":
         out = []
         for kind, nome in (("fato", "Fatos"), ("licao", "Licoes"), ("exemplo", "Exemplos")):
-            items = load(kind)
+            items = load(kind, who)
             out.append(f"{nome} ({len(items)}):")
             out += [f"  [{i['id']}] {i['texto'][:100]}" for i in items[-15:]]
         return "\n".join(out)
@@ -371,7 +451,7 @@ form{display:flex;gap:8px;padding:10px;border-top:1px solid #22252d}
 textarea{flex:1;resize:none;max-height:140px;padding:11px;border-radius:12px;border:1px solid #2a2e37;background:#181b22;color:inherit;font-size:16px;font-family:inherit}
 button.send{padding:0 18px;border:0;border-radius:12px;background:#6d5efc;color:#fff;font-weight:600;font-size:16px}
 </style></head><body>
-<header><b>Nexo</b><a href="/logout">sair</a></header>
+<header><b>Nexo</b><span id="left" style="font-size:13px;color:#8a8fa0"></span><a href="/logout">sair</a></header>
 <div id="log"></div>
 <form id="f"><textarea id="t" rows="1" placeholder="Fale com o Nexo... (/ajuda)"></textarea><button class="send">Enviar</button></form>
 <script>
@@ -392,9 +472,56 @@ f.onsubmit=async e=>{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
     if(r.status===401){location='/login';return;}
     const j=await r.json();w.remove();add('a',j.reply||('Erro: '+j.error),j.id);
+    if(j.left!=null)document.getElementById('left').textContent='restam '+j.left+' hoje';
   }catch(err){w.remove();add('a','Erro de conexao: '+err);}
 };
 </script></body></html>'''
+
+
+_usage_lock = threading.Lock()
+
+
+def _usage_file():
+    return DATA / "usage.json"
+
+
+def _usage_read():
+    try:
+        return json.loads(_usage_file().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def usage_take(who):
+    """Gasta 1 mensagem do dia. Dono: None (ilimitado). Convidado: restantes, ou -1 se acabou."""
+    if is_owner(who):
+        return None
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _usage_lock:
+        data = {k: v for k, v in _usage_read().items() if v.get("date") == today}
+        rec = data.get(who, {"date": today, "n": 0})
+        if rec["n"] >= GUEST_LIMIT:
+            return -1
+        rec["n"] += 1
+        data[who] = rec
+        DATA.mkdir(exist_ok=True)
+        _usage_file().write_text(json.dumps(data), encoding="utf-8")
+        return GUEST_LIMIT - rec["n"]
+
+
+def usage_refund(who):
+    """Devolve a mensagem se o modelo falhou."""
+    if is_owner(who):
+        return
+    with _usage_lock:
+        data = _usage_read()
+        if who in data and data[who].get("n", 0) > 0:
+            data[who]["n"] -= 1
+            _usage_file().write_text(json.dumps(data), encoding="utf-8")
+
+
+def guest_allowed(mail):
+    return "*" in GUESTS or mail in GUESTS
 
 
 def create_app():
@@ -411,13 +538,13 @@ def create_app():
     app.permanent_session_lifetime = timedelta(days=30)
     app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
-    history, recent = [], {}
+    histories, recent, last = {}, {}, {}
     fails = {"n": 0, "until": 0.0}
 
     def login_required(fn):
         @wraps(fn)
         def wrapper(*a, **k):
-            if session.get("ok") is not True:
+            if session.get("ok") is not True or not session.get("user"):
                 if request.path.startswith("/api/"):
                     return jsonify(error="nao autorizado"), 401
                 return redirect("/login")
@@ -440,6 +567,7 @@ def create_app():
                 fails["n"] = 0
                 session.permanent = True
                 session["ok"] = True
+                session["user"] = ALLOWED_EMAIL  # senha so vale para o dono
                 return redirect("/")
             else:
                 fails["n"] += 1
@@ -481,9 +609,11 @@ def create_app():
         except Exception as ex:
             return login_page(f"Falha ao falar com o Google: {ex}")
         mail = str(info.get("email", "")).strip().lower()
-        if info.get("email_verified") is True and mail and hmac.compare_digest(mail, ALLOWED_EMAIL):
+        if info.get("email_verified") is True and mail and \
+                (hmac.compare_digest(mail, ALLOWED_EMAIL) or guest_allowed(mail)):
             session.permanent = True
             session["ok"] = True
+            session["user"] = mail
             return redirect("/")
         return login_page("Essa conta Google nao tem acesso ao Nexo.")
 
@@ -503,31 +633,43 @@ def create_app():
         msg = ((request.get_json(silent=True) or {}).get("message") or "").strip()
         if not msg:
             return jsonify(error="mensagem vazia"), 400
+        who = session["user"]
+        history = histories.setdefault(who, [])
+        msg = msg[:8000]
         if msg.startswith("/"):
-            return jsonify(reply=command(msg, history))
+            return jsonify(reply=command(msg, history, who))
+        if len(msg) <= 60 and PRAISE.search(norm(msg).strip()) and who in last:
+            q, a = last[who]  # o usuario aprovou a resposta anterior: aprende sozinho
+            if add("exemplo", q, who, resposta=a):
+                print("[aprendi] exemplo aprovado")
+        left = usage_take(who)
+        if left == -1:
+            return jsonify(reply=f"Você atingiu o limite de {GUEST_LIMIT} mensagens de hoje. Volte amanhã!", left=0)
         history.append({"role": "user", "content": msg})
-        messages = [{"role": "system", "content": build_system(msg)}] + history[-HIST:]
+        messages = [{"role": "system", "content": build_system(msg, who)}] + history[-HIST:]
         try:
             reply = llm(messages)
         except Exception as e:
             history.pop()
-            return jsonify(error=f"falha ao falar com o modelo: {e}"), 502
+            usage_refund(who)
+            return jsonify(error=f"falha ao falar com o modelo: {friendly_error(e)}"), 502
         history.append({"role": "assistant", "content": reply})
+        last[who] = (msg, reply)
         mid = uuid.uuid4().hex[:8]
-        recent[mid] = (msg, reply)
+        recent[mid] = (who, msg, reply)
         while len(recent) > 50:
             recent.pop(next(iter(recent)))
         if AUTOLEARN:
-            threading.Thread(target=autolearn, args=(msg, reply), daemon=True).start()
-        return jsonify(reply=reply, id=mid)
+            threading.Thread(target=autolearn, args=(msg, reply, who), daemon=True).start()
+        return jsonify(reply=reply, id=mid, left=left)
 
     @app.post("/api/like")
     @login_required
     def like():
         mid = (request.get_json(silent=True) or {}).get("id")
-        if mid in recent:
-            q, a = recent[mid]
-            add("exemplo", q, resposta=a)
+        if mid in recent and recent[mid][0] == session["user"]:
+            _, q, a = recent[mid]
+            add("exemplo", q, session["user"], resposta=a)
         return jsonify(ok=True)
 
     return app
@@ -538,6 +680,7 @@ def run():
         print("Primeiro rode: python nexo.py setup")
         sys.exit(1)
     sync_pull()
+    ensure_ollama()
     app = create_app()
     print(f"Nexo rodando. Abra no navegador: http://localhost:{PORT}  (modelo: {MODEL})")
     app.run(host="127.0.0.1", port=PORT, threaded=True)
