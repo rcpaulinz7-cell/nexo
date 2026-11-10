@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlencode, urlparse
 
 BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"      # fica so no celular (senha, chave da sessao)
@@ -42,6 +43,10 @@ NEXO_API_KEY=
 
 NEXO_PORT=5000
 NEXO_AUTOLEARN=1
+
+# Login com Google (preencha com: python nexo.py google)
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
 """
 GITIGNORE = ".env\ndata/\n__pycache__/\n"
 
@@ -63,6 +68,10 @@ MODEL = os.getenv("NEXO_MODEL", "qwen2.5-coder:1.5b")
 API_KEY = os.getenv("NEXO_API_KEY", "")
 PORT = int(os.getenv("NEXO_PORT", "5000"))
 AUTOLEARN = os.getenv("NEXO_AUTOLEARN", "1") == "1"
+GOOGLE_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+# Abra o Nexo por http://localhost:PORT (e nao 127.0.0.1) para o login Google funcionar.
+REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", f"http://localhost:{PORT}/auth/google/callback")
 HIST = 12  # mensagens recentes enviadas ao modelo
 
 SYSTEM = (
@@ -89,7 +98,7 @@ def check_login(email, password):
         return False
     ok_email = hmac.compare_digest(email.strip().lower(), ALLOWED_EMAIL) and \
         hmac.compare_digest(auth.get("email", ""), ALLOWED_EMAIL)
-    ok_pw = hmac.compare_digest(_hash(password, bytes.fromhex(auth.get("salt", "00"))),
+    ok_pw = hmac.compare_digest(_hash(password.strip(), bytes.fromhex(auth.get("salt", "00"))),
                                 auth.get("hash", ""))
     return ok_email and ok_pw
 
@@ -106,13 +115,28 @@ def setup():
     if email != ALLOWED_EMAIL:
         print(f"Esse email nao e o autorizado ({ALLOWED_EMAIL}).")
         sys.exit(1)
-    pw = getpass.getpass("Crie uma senha (minimo 8 caracteres): ")
-    if len(pw) < 8 or pw != getpass.getpass("Repita a senha: "):
+    pw = input("Crie uma senha (minimo 8 caracteres, a senha aparece na tela): ").strip()
+    if len(pw) < 8 or pw != input("Repita a senha: ").strip():
         print("Senha curta demais ou diferente. Rode o setup de novo.")
         sys.exit(1)
     salt = secrets.token_bytes(16)
     _auth_file().write_text(json.dumps({"email": email, "salt": salt.hex(), "hash": _hash(pw, salt)}))
     print("Pronto! Agora rode: python nexo.py")
+
+
+def google_setup():
+    """Guarda GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no .env."""
+    cid = input("Client ID do Google: ").strip()
+    secret = input("Client Secret do Google: ").strip()
+    if not cid or not secret:
+        print("Os dois campos sao obrigatorios.")
+        sys.exit(1)
+    env = BASE / ".env"
+    lines = env.read_text(encoding="utf-8").splitlines() if env.exists() else []
+    lines = [l for l in lines if not l.startswith(("GOOGLE_CLIENT_ID=", "GOOGLE_CLIENT_SECRET="))]
+    lines += [f"GOOGLE_CLIENT_ID={cid}", f"GOOGLE_CLIENT_SECRET={secret}"]
+    env.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("Salvo no .env. Reinicie o Nexo e abra http://localhost:5000")
 
 
 # --------------------------------------------------------------------- memoria
@@ -320,9 +344,15 @@ button{background:#6d5efc;border:0;font-weight:600}
 .err{color:#ff8080;font-size:14px;min-height:18px}
 </style></head><body>
 <form method="post"><h1>Nexo</h1>
-<input name="email" type="email" placeholder="Email" autocomplete="username" required>
-<input name="password" type="password" placeholder="Senha" autocomplete="current-password" required>
+__GOOGLE__
+<input name="email" type="email" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Email" autocomplete="username" required>
+<input id="pw" name="password" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Senha" autocomplete="current-password" required>
+<label style="font-size:14px;color:#8a8fa0"><input type="checkbox" onclick="document.getElementById('pw').type=this.checked?'text':'password'"> mostrar senha</label>
 <div class="err">__ERR__</div><button>Entrar</button></form></body></html>'''
+
+GOOGLE_BTN = ('<a href="/auth/google" style="padding:13px;border-radius:10px;background:#fff;color:#222;'
+              'text-align:center;text-decoration:none;font-weight:600">Entrar com Google</a>'
+              '<div style="text-align:center;color:#8a8fa0;font-size:13px">ou com senha</div>')
 
 CHAT_HTML = r'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Nexo</title>
