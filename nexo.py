@@ -81,7 +81,8 @@ REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", f"http://localhost:{PORT}/auth/g
 # separados por virgula; deixe vazio para desligar. O dono (NEXO_EMAIL) nunca tem limite.
 GUESTS = [g.strip().lower() for g in os.getenv("NEXO_GUESTS", "*").split(",") if g.strip()]
 GUEST_LIMIT = int(os.getenv("NEXO_GUEST_LIMIT", "100"))  # mensagens por dia
-HIST = 12  # mensagens recentes enviadas ao modelo
+HIST = int(os.getenv("NEXO_HIST", "6"))  # mensagens recentes enviadas ao modelo (menos = mais rapido)
+MAX_TOKENS = int(os.getenv("NEXO_MAX_TOKENS", "600"))  # tamanho maximo da resposta
 
 SYSTEM = (
     "Voce e o Nexo, uma IA pessoal de programacao e conversa. Responda em portugues do Brasil, "
@@ -291,15 +292,43 @@ def sync_push(msg):
 
 # ---------------------------------------------------------------------- modelo
 
-def llm(messages, temperature=0.4):
-    import requests
-    headers = {"Content-Type": "application/json"}
+def _headers():
+    h = {"Content-Type": "application/json"}
     if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-    r = requests.post(f"{BASE_URL}/chat/completions", headers=headers, timeout=900,
-                      json={"model": MODEL, "messages": messages, "temperature": temperature})
+        h["Authorization"] = f"Bearer {API_KEY}"
+    return h
+
+
+def llm(messages, temperature=0.4, max_tokens=None):
+    import requests
+    body = {"model": MODEL, "messages": messages, "temperature": temperature}
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+    r = requests.post(f"{BASE_URL}/chat/completions", headers=_headers(), timeout=900, json=body)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
+
+
+def llm_stream(messages, temperature=0.4):
+    """Devolve a resposta aos pedacos, para aparecer na tela enquanto o modelo escreve."""
+    import requests
+    body = {"model": MODEL, "messages": messages, "temperature": temperature,
+            "stream": True, "max_tokens": MAX_TOKENS}
+    with requests.post(f"{BASE_URL}/chat/completions", headers=_headers(), timeout=900,
+                       json=body, stream=True) as r:
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                tok = json.loads(data)["choices"][0]["delta"].get("content") or ""
+            except (ValueError, KeyError, IndexError):
+                continue
+            if tok:
+                yield tok
 
 
 def friendly_error(e):
@@ -324,7 +353,8 @@ def ensure_ollama():
     except Exception:
         pass
     print("Ligando o Ollama...")
-    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     env={**os.environ, "OLLAMA_KEEP_ALIVE": os.environ.get("OLLAMA_KEEP_ALIVE", "30m")})
     for _ in range(20):
         time.sleep(1)
         try:
@@ -364,7 +394,7 @@ def autolearn(user, reply, who=None):
         return
     try:
         out = llm([{"role": "system", "content": EXTRACT},
-                   {"role": "user", "content": user[:1500]}], 0)
+                   {"role": "user", "content": user[:1500]}], 0, 200)
         m = re.search(r"\{.*\}", out, re.S)
         data = json.loads(m.group(0)) if m else {}
         for key, kind in (("fatos", "fato"), ("licoes", "licao")):
@@ -458,21 +488,36 @@ button.send{padding:0 18px;border:0;border-radius:12px;background:#6d5efc;color:
 const log=document.getElementById('log'),t=document.getElementById('t'),f=document.getElementById('f');
 const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
 function render(x){return x.split('```').map((p,i)=>i%2?'<pre><code>'+esc(p.replace(/^\w*\n/,''))+'</code></pre>':esc(p)).join('');}
+function likeBtn(d,id){const b=document.createElement('button');b.className='like';b.textContent='👍';
+  b.onclick=async()=>{await fetch('/api/like',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});b.textContent='👍 guardado';b.disabled=true;};
+  d.appendChild(b);}
 function add(cls,text,id){
   const d=document.createElement('div');d.className='m '+cls;d.innerHTML=render(text);
-  if(id){const b=document.createElement('button');b.className='like';b.textContent='👍';
-    b.onclick=async()=>{await fetch('/api/like',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});b.textContent='👍 guardado';b.disabled=true;};
-    d.appendChild(b);}
+  if(id)likeBtn(d,id);
   log.appendChild(d);log.scrollTop=log.scrollHeight;return d;
 }
+const setLeft=n=>{if(n!=null)document.getElementById('left').textContent='restam '+n+' hoje';};
 f.onsubmit=async e=>{
   e.preventDefault();const msg=t.value.trim();if(!msg)return;
   t.value='';add('u',msg);const w=add('a','...');
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
     if(r.status===401){location='/login';return;}
-    const j=await r.json();w.remove();add('a',j.reply||('Erro: '+j.error),j.id);
-    if(j.left!=null)document.getElementById('left').textContent='restam '+j.left+' hoje';
+    if(!(r.headers.get('content-type')||'').includes('ndjson')){
+      const j=await r.json();w.remove();add('a',j.reply||('Erro: '+j.error),j.id);setLeft(j.left);return;}
+    const rd=r.body.getReader(),dec=new TextDecoder();let buf='',txt='';
+    for(;;){
+      const {value,done}=await rd.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      let i;
+      while((i=buf.indexOf('\n'))>=0){
+        const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;
+        const j=JSON.parse(line);
+        if(j.t){txt+=j.t;w.innerHTML=render(txt);log.scrollTop=log.scrollHeight;}
+        else if(j.error){txt+=(txt?'\n\n':'')+'Erro: '+j.error;w.innerHTML=render(txt);}
+        else if(j.done){if(j.id)likeBtn(w,j.id);setLeft(j.left);}
+      }
+    }
   }catch(err){w.remove();add('a','Erro de conexao: '+err);}
 };
 </script></body></html>'''
@@ -525,7 +570,7 @@ def guest_allowed(mail):
 
 
 def create_app():
-    from flask import Flask, jsonify, redirect, request, session
+    from flask import Flask, Response, jsonify, redirect, request, session, stream_with_context
 
     DATA.mkdir(exist_ok=True)
     MEM.mkdir(exist_ok=True)
@@ -647,21 +692,31 @@ def create_app():
             return jsonify(reply=f"Você atingiu o limite de {GUEST_LIMIT} mensagens de hoje. Volte amanhã!", left=0)
         history.append({"role": "user", "content": msg})
         messages = [{"role": "system", "content": build_system(msg, who)}] + history[-HIST:]
-        try:
-            reply = llm(messages)
-        except Exception as e:
-            history.pop()
-            usage_refund(who)
-            return jsonify(error=f"falha ao falar com o modelo: {friendly_error(e)}"), 502
-        history.append({"role": "assistant", "content": reply})
-        last[who] = (msg, reply)
-        mid = uuid.uuid4().hex[:8]
-        recent[mid] = (who, msg, reply)
-        while len(recent) > 50:
-            recent.pop(next(iter(recent)))
-        if AUTOLEARN:
-            threading.Thread(target=autolearn, args=(msg, reply, who), daemon=True).start()
-        return jsonify(reply=reply, id=mid, left=left)
+        def gen():
+            parts = []
+            try:
+                for tok in llm_stream(messages):
+                    parts.append(tok)
+                    yield json.dumps({"t": tok}) + "\n"
+            except Exception as e:
+                if history and history[-1]["role"] == "user":
+                    history.pop()
+                usage_refund(who)
+                yield json.dumps({"error": f"falha ao falar com o modelo: {friendly_error(e)}"}) + "\n"
+                return
+            reply = "".join(parts).strip() or "(sem resposta)"
+            history.append({"role": "assistant", "content": reply})
+            last[who] = (msg, reply)
+            mid = uuid.uuid4().hex[:8]
+            recent[mid] = (who, msg, reply)
+            while len(recent) > 50:
+                recent.pop(next(iter(recent)))
+            if AUTOLEARN:
+                threading.Thread(target=autolearn, args=(msg, reply, who), daemon=True).start()
+            yield json.dumps({"done": True, "id": mid, "left": left}) + "\n"
+
+        return Response(stream_with_context(gen()), mimetype="application/x-ndjson",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.post("/api/like")
     @login_required
