@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-\"\"\"Nexo: IA pessoal com memoria que aprende e sincroniza com o GitHub.
+"""Nexo: IA pessoal com memoria que aprende e sincroniza com o GitHub.
 
 Uso:
     python nexo.py setup   -> cria .env, .gitignore e a senha de acesso
     python nexo.py         -> inicia o Nexo em http://127.0.0.1:5000
-\"\"\"
+"""
 import getpass
 import hashlib
 import hmac
@@ -28,7 +28,7 @@ BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"      # fica so no celular (senha, chave da sessao)
 MEM = BASE / "memoria"    # sincronizada com o GitHub
 
-ENV_TEMPLATE = \"\"\"# Email unico autorizado a usar o Nexo
+ENV_TEMPLATE = """# Email unico autorizado a usar o Nexo
 NEXO_EMAIL=rc.paulinz7@gmail.com
 
 # Modelo (qualquer API compativel com OpenAI).
@@ -52,7 +52,7 @@ NEXO_GUEST_LIMIT=100
 # Login com Google (preencha com: python nexo.py google)
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
-\"\"\"
+"""
 GITIGNORE = ".env\ndata/\n__pycache__/\n"
 
 
@@ -135,7 +135,7 @@ def setup():
 
 
 def google_setup():
-    \"\"\"Guarda GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no .env.\"\"\"
+    """Guarda GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no .env."""
     cid = input("Client ID do Google: ").strip()
     secret = input("Client Secret do Google: ").strip()
     if not cid or not secret:
@@ -160,7 +160,7 @@ def is_owner(who):
 
 
 def _dir(who=None):
-    \"\"\"Pasta de memoria: o dono usa memoria/; cada convidado tem a sua propria.\"\"\"
+    """Pasta de memoria: o dono usa memoria/; cada convidado tem a sua propria."""
     if is_owner(who):
         return MEM
     return MEM / "usuarios" / hashlib.sha256(who.encode()).hexdigest()[:12]
@@ -312,7 +312,7 @@ def llm(messages, temperature=0.4, max_tokens=None):
 
 
 def llm_stream(messages, temperature=0.4):
-    \"\"\"Devolve a resposta aos pedacos, para aparecer na tela enquanto o modelo escreve.\"\"\"
+    """Devolve a resposta aos pedacos, para aparecer na tela enquanto o modelo escreve."""
     import requests
     body = {"model": MODEL, "messages": messages, "temperature": temperature,
             "stream": True, "max_tokens": MAX_TOKENS}
@@ -345,7 +345,7 @@ def friendly_error(e):
 
 
 def ensure_ollama():
-    \"\"\"Se o modelo for um Ollama local que esta desligado, tenta ligar sozinho.\"\"\"
+    """Se o modelo for um Ollama local que esta desligado, tenta ligar sozinho."""
     if "11434" not in BASE_URL or not shutil.which("ollama"):
         return
     import requests
@@ -429,7 +429,7 @@ def _keep(kind, text, who=None):
 
 
 def learn_fast(user, who=None):
-    \"\"\"Aprende na hora, sem gastar o modelo: fatos e regras ditos de forma direta.\"\"\"
+    """Aprende na hora, sem gastar o modelo: fatos e regras ditos de forma direta."""
     try:
         for sent in re.split(r"(?<=[.!?])\s+|\n+", user[:2000]):
             sent = sent.strip()
@@ -446,7 +446,7 @@ def learn_fast(user, who=None):
 
 
 def learn_llm(text, who=None):
-    \"\"\"Extracao mais profunda com o modelo (roda so quando o Nexo esta parado).\"\"\"
+    """Extracao mais profunda com o modelo (roda so quando o Nexo esta parado)."""
     try:
         out = llm([{"role": "system", "content": EXTRACT},
                    {"role": "user", "content": text[:2000]}], 0, 250)
@@ -468,7 +468,7 @@ def queue_learning(who, msg):
 
 
 def idle_worker():
-    \"\"\"Quando ninguem esta conversando, o Nexo revisa as ultimas mensagens e aprende mais.\"\"\"
+    """Quando ninguem esta conversando, o Nexo revisa as ultimas mensagens e aprende mais."""
     while True:
         time.sleep(5)
         try:
@@ -703,7 +703,7 @@ def _usage_read():
 
 
 def usage_take(who):
-    \"\"\"Gasta 1 mensagem do dia. Dono: None (ilimitado). Convidado: restantes, ou -1 se acabou.\"\"\"
+    """Gasta 1 mensagem do dia. Dono: None (ilimitado). Convidado: restantes, ou -1 se acabou."""
     if is_owner(who):
         return None
     today = datetime.now().strftime("%Y-%m-%d")
@@ -720,7 +720,7 @@ def usage_take(who):
 
 
 def usage_refund(who):
-    \"\"\"Devolve a mensagem se o modelo falhou.\"\"\"
+    """Devolve a mensagem se o modelo falhou."""
     if is_owner(who):
         return
     with _usage_lock:
@@ -852,7 +852,7 @@ def create_app():
         params = {"client_id": GOOGLE_ID, "redirect_uri": REDIRECT_URI, "response_type": "code",
                   "scope": "openid email", "state": state, "login_hint": ALLOWED_EMAIL,
                   "prompt": "select_account"}
-        return redirect("https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params))
+        return redirect("[https://accounts.google.com/o/oauth2/v2/auth](https://accounts.google.com/o/oauth2/v2/auth)?" + urlencode(params))
 
     @app.route("/auth/google/callback")
     def google_callback():
@@ -862,12 +862,12 @@ def create_app():
         if request.args.get("error") or not expected or not hmac.compare_digest(expected, got):
             return login_page("Login com Google cancelado ou invalido. Tente de novo.")
         try:
-            tok = requests.post("https://oauth2.googleapis.com/token", timeout=20, data={
+            tok = requests.post("[https://oauth2.googleapis.com/token](https://oauth2.googleapis.com/token)", timeout=20, data={
                 "code": request.args.get("code", ""), "client_id": GOOGLE_ID,
                 "client_secret": GOOGLE_SECRET, "redirect_uri": REDIRECT_URI,
                 "grant_type": "authorization_code"})
             tok.raise_for_status()
-            info = requests.get("https://openidconnect.googleapis.com/v1/userinfo", timeout=20,
+            info = requests.get("[https://openidconnect.googleapis.com/v1/userinfo](https://openidconnect.googleapis.com/v1/userinfo)", timeout=20,
                                 headers={"Authorization": "Bearer " + tok.json()["access_token"]}).json()
         except Exception as ex:
             return login_page(f"Falha ao falar com o Google: {ex}")
