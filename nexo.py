@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Nexo: IA pessoal com memoria que aprende e sincroniza com o GitHub.
+\"\"\"Nexo: IA pessoal com memoria que aprende e sincroniza com o GitHub.
 
 Uso:
     python nexo.py setup   -> cria .env, .gitignore e a senha de acesso
     python nexo.py         -> inicia o Nexo em http://127.0.0.1:5000
-"""
+\"\"\"
 import getpass
 import hashlib
 import hmac
@@ -28,7 +28,7 @@ BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"      # fica so no celular (senha, chave da sessao)
 MEM = BASE / "memoria"    # sincronizada com o GitHub
 
-ENV_TEMPLATE = """# Email unico autorizado a usar o Nexo
+ENV_TEMPLATE = \"\"\"# Email unico autorizado a usar o Nexo
 NEXO_EMAIL=rc.paulinz7@gmail.com
 
 # Modelo (qualquer API compativel com OpenAI).
@@ -52,7 +52,7 @@ NEXO_GUEST_LIMIT=100
 # Login com Google (preencha com: python nexo.py google)
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
-"""
+\"\"\"
 GITIGNORE = ".env\ndata/\n__pycache__/\n"
 
 
@@ -135,7 +135,7 @@ def setup():
 
 
 def google_setup():
-    """Guarda GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no .env."""
+    \"\"\"Guarda GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no .env.\"\"\"
     cid = input("Client ID do Google: ").strip()
     secret = input("Client Secret do Google: ").strip()
     if not cid or not secret:
@@ -160,7 +160,7 @@ def is_owner(who):
 
 
 def _dir(who=None):
-    """Pasta de memoria: o dono usa memoria/; cada convidado tem a sua propria."""
+    \"\"\"Pasta de memoria: o dono usa memoria/; cada convidado tem a sua propria.\"\"\"
     if is_owner(who):
         return MEM
     return MEM / "usuarios" / hashlib.sha256(who.encode()).hexdigest()[:12]
@@ -312,7 +312,7 @@ def llm(messages, temperature=0.4, max_tokens=None):
 
 
 def llm_stream(messages, temperature=0.4):
-    """Devolve a resposta aos pedacos, para aparecer na tela enquanto o modelo escreve."""
+    \"\"\"Devolve a resposta aos pedacos, para aparecer na tela enquanto o modelo escreve.\"\"\"
     import requests
     body = {"model": MODEL, "messages": messages, "temperature": temperature,
             "stream": True, "max_tokens": MAX_TOKENS}
@@ -345,7 +345,7 @@ def friendly_error(e):
 
 
 def ensure_ollama():
-    """Se o modelo for um Ollama local que esta desligado, tenta ligar sozinho."""
+    \"\"\"Se o modelo for um Ollama local que esta desligado, tenta ligar sozinho.\"\"\"
     if "11434" not in BASE_URL or not shutil.which("ollama"):
         return
     import requests
@@ -429,7 +429,7 @@ def _keep(kind, text, who=None):
 
 
 def learn_fast(user, who=None):
-    """Aprende na hora, sem gastar o modelo: fatos e regras ditos de forma direta."""
+    \"\"\"Aprende na hora, sem gastar o modelo: fatos e regras ditos de forma direta.\"\"\"
     try:
         for sent in re.split(r"(?<=[.!?])\s+|\n+", user[:2000]):
             sent = sent.strip()
@@ -446,7 +446,7 @@ def learn_fast(user, who=None):
 
 
 def learn_llm(text, who=None):
-    """Extracao mais profunda com o modelo (roda so quando o Nexo esta parado)."""
+    \"\"\"Extracao mais profunda com o modelo (roda so quando o Nexo esta parado).\"\"\"
     try:
         out = llm([{"role": "system", "content": EXTRACT},
                    {"role": "user", "content": text[:2000]}], 0, 250)
@@ -468,7 +468,7 @@ def queue_learning(who, msg):
 
 
 def idle_worker():
-    """Quando ninguem esta conversando, o Nexo revisa as ultimas mensagens e aprende mais."""
+    \"\"\"Quando ninguem esta conversando, o Nexo revisa as ultimas mensagens e aprende mais.\"\"\"
     while True:
         time.sleep(5)
         try:
@@ -550,36 +550,49 @@ CHAT_HTML = r'''<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 body{margin:0;height:100dvh;display:flex;flex-direction:column;background:#0f1115;color:#e8e8ea;font-family:system-ui,sans-serif}
 header{padding:10px 16px;border-bottom:1px solid #22252d;display:flex;justify-content:space-between;align-items:center}
 header b{font-size:18px}header a{color:#8a8fa0;font-size:13px;text-decoration:none}
-#menu{background:none;border:0;color:#e8e8ea;font-size:24px;padding:2px 12px 2px 0;line-height:1}
+#menu{background:none;border:0;color:#e8e8ea;font-size:24px;padding:2px 12px 2px 0;line-height:1;cursor:pointer}
 #log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
 .m{max-width:88%;padding:10px 13px;border-radius:14px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word}
 .u{align-self:flex-end;background:#6d5efc}
 .a{align-self:flex-start;background:#1b1e26}
 .m pre{background:#0b0d11;padding:10px;border-radius:8px;overflow-x:auto;white-space:pre;margin:8px 0}
 .like{display:block;margin-top:6px;background:none;border:0;font-size:16px;opacity:.6}
-form{display:flex;gap:8px;padding:10px;border-top:1px solid #22252d}
+form{display:flex;gap:8px;padding:10px;border-top:1px solid #22252d;align-items:center}
 textarea{flex:1;resize:none;max-height:140px;padding:11px;border-radius:12px;border:1px solid #2a2e37;background:#181b22;color:inherit;font-size:16px;font-family:inherit}
-button.send{padding:0 18px;border:0;border-radius:12px;background:#6d5efc;color:#fff;font-weight:600;font-size:16px}
+button.send{padding:0 18px;height:44px;border:0;border-radius:12px;background:#6d5efc;color:#fff;font-weight:600;font-size:16px;cursor:pointer}
 #ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:5}
 #side{position:fixed;top:0;left:0;bottom:0;width:min(310px,84vw);background:#14171d;border-right:1px solid #22252d;transform:translateX(-100%);transition:transform .2s;z-index:6;display:flex;flex-direction:column}
 body.open #side{transform:none}body.open #ov{display:block}
 #side h2{margin:0;padding:16px 16px 4px;font-size:18px}
-#new{margin:12px;padding:12px;border-radius:10px;border:0;background:#6d5efc;color:#fff;font-weight:600;font-size:15px}
+#new{margin:12px;padding:12px;border-radius:10px;border:0;background:#6d5efc;color:#fff;font-weight:600;font-size:15px;cursor:pointer}
 #list{flex:1;overflow-y:auto;padding:0 8px 12px}
-.ci{display:flex;align-items:center;gap:6px;padding:11px 10px;border-radius:10px;font-size:15px}
+.ci{display:flex;align-items:center;gap:6px;padding:11px 10px;border-radius:10px;font-size:15px;cursor:pointer}
 .ci.on{background:#1f2330}
 .ci span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ci button{background:none;border:0;color:#8a8fa0;font-size:15px;padding:2px 6px}
+.ci button{background:none;border:0;color:#8a8fa0;font-size:15px;padding:2px 6px;cursor:pointer}
 .vazio{color:#8a8fa0;padding:12px;font-size:14px}
+#clipBtn{background:none;border:0;font-size:24px;cursor:pointer;padding:0 4px;color:#8a8fa0;transition:color 0.2s}
 </style></head><body>
 <div id="ov"></div>
 <aside id="side"><h2>Conversas</h2><button id="new">＋ Novo chat</button><div id="list"></div></aside>
-<header><div style="display:flex;align-items:center"><button id="menu" aria-label="Menu">☰</button><b>Nexo</b></div><span id="left" style="font-size:13px;color:#8a8fa0"></span><a href="/logout">sair</a></header>
+<header><div style="display:flex;align-items:center"><button id="menu" aria-label="Menu" title="Ver Histórico">☰</button><b>Nexo</b></div><span id="left" style="font-size:13px;color:#8a8fa0"></span><a href="/logout">sair</a></header>
 <div id="log"></div>
-<form id="f"><textarea id="t" rows="1" placeholder="Fale com o Nexo... (/ajuda)"></textarea><button class="send">Enviar</button></form>
+<form id="f">
+  <button type="button" id="clipBtn" title="Anexar arquivo">📎</button>
+  <input type="file" id="file" style="display:none">
+  <textarea id="t" rows="1" placeholder="Fale com o Nexo... (/ajuda)"></textarea>
+  <button class="send">Enviar</button>
+</form>
 <script>
 const log=document.getElementById('log'),t=document.getElementById('t'),f=document.getElementById('f');
-let cur=null,busy=false;
+let cur=localStorage.getItem('nexo_cur'),busy=false;
+
+function setCur(id){
+  cur=id;
+  if(id) localStorage.setItem('nexo_cur',id);
+  else localStorage.removeItem('nexo_cur');
+}
+
 const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
 function render(x){return x.split('```').map((p,i)=>i%2?'<pre><code>'+esc(p.replace(/^\w*\n/,''))+'</code></pre>':esc(p)).join('');}
 function likeBtn(d,id){const b=document.createElement('button');b.className='like';b.textContent='👍';
@@ -607,24 +620,48 @@ async function loadList(){
   if(!j.chats.length)el.innerHTML='<div class="vazio">Nenhuma conversa ainda.</div>';
   return j.chats;
 }
-function newChat(close=true){cur=null;log.innerHTML='';if(close)openMenu(false);t.focus();}
+function newChat(close=true){setCur(null);log.innerHTML='';if(close)openMenu(false);t.focus();}
 async function openChat(id){
   const j=await api('/api/chats/'+id);
   if(j.error){newChat(false);return;}
-  cur=id;log.innerHTML='';j.msgs.forEach(m=>add(m.role==='user'?'u':'a',m.content));
+  setCur(id);log.innerHTML='';j.msgs.forEach(m=>add(m.role==='user'?'u':'a',m.content));
 }
 document.getElementById('menu').onclick=()=>{openMenu(true);loadList();};
 document.getElementById('ov').onclick=()=>openMenu(false);
 document.getElementById('new').onclick=()=>newChat(true);
+
+const fileInput=document.getElementById('file');
+const clipBtn=document.getElementById('clipBtn');
+let currentFile=null;
+clipBtn.onclick=()=>fileInput.click();
+fileInput.onchange=e=>{
+  currentFile=e.target.files[0];
+  clipBtn.style.color=currentFile?'#6d5efc':'#8a8fa0';
+};
+
 f.onsubmit=async e=>{
-  e.preventDefault();const msg=t.value.trim();if(!msg||busy)return;
+  e.preventDefault();const msg=t.value.trim();if((!msg && !currentFile)||busy)return;
   if(msg.toLowerCase()==='/novo'){t.value='';newChat(false);return;}
-  busy=true;t.value='';add('u',msg);const w=add('a','...');
+  busy=true;t.value='';
+  
+  let displayMsg = msg;
+  if(currentFile) displayMsg += (msg ? '\n' : '') + '📎 ' + currentFile.name;
+  add('u', displayMsg);
+  const w=add('a','...');
+  
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,chat_id:cur})});
+    const formData=new FormData();
+    formData.append('message', msg);
+    if(cur) formData.append('chat_id', cur);
+    if(currentFile){
+      formData.append('file', currentFile);
+      currentFile=null; clipBtn.style.color='#8a8fa0'; fileInput.value='';
+    }
+    
+    const r=await fetch('/api/chat',{method:'POST',body:formData});
     if(r.status===401){location='/login';return;}
     if(!(r.headers.get('content-type')||'').includes('ndjson')){
-      const j=await r.json();w.remove();add('a',j.reply||('Erro: '+j.error),j.id);setLeft(j.left);if(j.chat)cur=j.chat;return;}
+      const j=await r.json();w.remove();add('a',j.reply||('Erro: '+j.error),j.id);setLeft(j.left);if(j.chat)setCur(j.chat);return;}
     const rd=r.body.getReader(),dec=new TextDecoder();let buf='',txt='';
     for(;;){
       const {value,done}=await rd.read();if(done)break;
@@ -635,13 +672,19 @@ f.onsubmit=async e=>{
         const j=JSON.parse(line);
         if(j.t){txt+=j.t;w.innerHTML=render(txt);log.scrollTop=log.scrollHeight;}
         else if(j.error){txt+=(txt?'\n\n':'')+'Erro: '+j.error;w.innerHTML=render(txt);}
-        else if(j.done){if(j.chat)cur=j.chat;if(j.id)likeBtn(w,j.id);setLeft(j.left);}
+        else if(j.done){if(j.chat)setCur(j.chat);if(j.id)likeBtn(w,j.id);setLeft(j.left);}
       }
     }
   }catch(err){w.remove();add('a','Erro de conexao: '+err);}
   finally{busy=false;}
 };
-(async()=>{try{const l=await loadList();if(l.length)openChat(l[0].id);}catch(e){}})();
+(async()=>{try{
+  const l=await loadList();
+  if(l.length){
+    if(cur && l.find(c=>c.id===cur)) openChat(cur);
+    else openChat(l[0].id);
+  }
+}catch(e){}})();
 </script></body></html>'''
 
 
@@ -660,7 +703,7 @@ def _usage_read():
 
 
 def usage_take(who):
-    """Gasta 1 mensagem do dia. Dono: None (ilimitado). Convidado: restantes, ou -1 se acabou."""
+    \"\"\"Gasta 1 mensagem do dia. Dono: None (ilimitado). Convidado: restantes, ou -1 se acabou.\"\"\"
     if is_owner(who):
         return None
     today = datetime.now().strftime("%Y-%m-%d")
@@ -677,7 +720,7 @@ def usage_take(who):
 
 
 def usage_refund(who):
-    """Devolve a mensagem se o modelo falhou."""
+    \"\"\"Devolve a mensagem se o modelo falhou.\"\"\"
     if is_owner(who):
         return
     with _usage_lock:
@@ -850,13 +893,40 @@ def create_app():
     @app.post("/api/chat")
     @login_required
     def chat():
-        body = request.get_json(silent=True) or {}
-        msg = (body.get("message") or "").strip()
+        if request.is_json:
+            body = request.get_json(silent=True) or {}
+            msg = (body.get("message") or "").strip()
+            chat_id = body.get("chat_id")
+        else:
+            msg = request.form.get("message", "").strip()
+            chat_id = request.form.get("chat_id")
+            if chat_id == "null": 
+                chat_id = None
+            
+            file = request.files.get("file")
+            if file and file.filename:
+                uploads_dir = DATA / "uploads"
+                uploads_dir.mkdir(exist_ok=True)
+                filepath = uploads_dir / file.filename
+                file.save(filepath)
+                
+                ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else ''
+                if ext in ['txt', 'py', 'md', 'js', 'html', 'json', 'csv', 'mcaddon']:
+                    try:
+                        content = filepath.read_text(encoding='utf-8')[:4000]
+                        msg += f"\n\n[O usuário anexou o arquivo: {file.filename}]\nConteúdo:\n{content}"
+                    except Exception:
+                        msg += f"\n\n[O usuário anexou o arquivo: {file.filename}]"
+                else:
+                    msg += f"\n\n[O usuário enviou o arquivo: {file.filename}. Você não consegue ver a imagem ou o vídeo diretamente, mas saiba que o arquivo foi recebido e salvo no servidor.]"
+
         if not msg:
             return jsonify(error="mensagem vazia"), 400
+        
         who = session["user"]
         msg = msg[:8000]
-        c = chat_load(who, body.get("chat_id")) or chat_new(msg)
+        c = chat_load(who, chat_id) or chat_new(msg)
+        
         if msg.startswith("/"):
             if msg.split()[0].lower() == "/novo":
                 return jsonify(reply="Para começar outra conversa, toque em ＋ Novo chat no menu (☰).")
@@ -865,13 +935,16 @@ def create_app():
                           {"role": "assistant", "content": reply, "cmd": True}]
             chat_save(who, c)
             return jsonify(reply=reply, chat=c["id"])
+            
         if len(msg) <= 60 and PRAISE.search(norm(msg).strip()) and who in last:
-            q, a = last[who]  # o usuario aprovou a resposta anterior: aprende sozinho
+            q, a = last[who]
             if add("exemplo", q, who, resposta=a):
                 print("[aprendi] exemplo aprovado")
+                
         left = usage_take(who)
         if left == -1:
             return jsonify(reply=f"Você atingiu o limite de {GUEST_LIMIT} mensagens de hoje. Volte amanhã!", left=0)
+            
         history = [{"role": m["role"], "content": m["content"][:1500]} for m in c["msgs"] if not m.get("cmd")]
         history.append({"role": "user", "content": msg})
         messages = [{"role": "system", "content": build_system(msg, who)}] + history[-HIST:]
@@ -910,6 +983,7 @@ def create_app():
 
         return Response(stream_with_context(gen()), mimetype="application/x-ndjson",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 
     @app.get("/api/chats")
     @login_required
